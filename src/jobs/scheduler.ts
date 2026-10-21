@@ -40,6 +40,8 @@ import { runSep24InteractiveExpirationJob } from "./sep24InteractiveExpirationJo
 import { runDailySarSummaryJob } from "./dailySarSummaryJob";
 import { runPartitionManagerJob } from "./partitionManager";
 import { withJobTrace } from "../queue/jobTracing";
+import { runKycRetentionPurgeJob } from "./kycRetentionPurgeJob";
+import { runRiskTierRecalculationJob } from "./riskTierRecalculationJob";
 
 interface JobConfig {
   name: string;
@@ -282,6 +284,23 @@ const JOBS: JobConfig[] = [
     // configurable expiry duration and transitions them to expired (#2264)
     schedule: process.env.SEP24_INTERACTIVE_EXPIRATION_CRON || "* * * * *",
     handler: runSep24InteractiveExpirationJob,
+  },
+  {
+    name: "kyc-retention-purge",
+    // Daily at 03:30 UTC — securely purges KYC identity documents for closed
+    // accounts that have exceeded the legal retention window (default: 5 years).
+    // Satisfies GDPR Article 17 and regional data protection obligations.
+    schedule: process.env.KYC_RETENTION_PURGE_CRON || "30 3 * * *",
+    timezone: "UTC",
+    handler: runKycRetentionPurgeJob,
+  },
+  {
+    name: "risk-tier-recalculation",
+    // Every 6 hours — recalculates Low/Medium/High risk tiers for active
+    // customers so daily limits and mandatory 2FA stay current with behaviour.
+    schedule: process.env.RISK_TIER_RECALCULATION_CRON || "0 */6 * * *",
+    timezone: "UTC",
+    handler: runRiskTierRecalculationJob,
   },
 ];
 

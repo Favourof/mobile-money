@@ -76,6 +76,8 @@ import { HealthCheckResponse, ReadinessCheckResponse } from "./types/api";
 import { privacyRoutes } from "./routes/privacy";
 import { developerDashboardRoutes } from "./routes/developerDashboard";
 import { travelRuleRoutes } from "./routes/travelRule";
+import { complianceRoutes } from "./routes/compliance";
+import { makerCheckerRoutes } from "./routes/makerChecker";
 import mtnCallbacksRouter from "./routes/mtnCallbacks";
 import mpesaCallbacksRouter from "./routes/mpesaCallbacks";
 import { createMpesaC2BRouter } from "./providers/mpesa/c2b";
@@ -97,6 +99,7 @@ import tomlRouter from "./routes/toml";
 import feeStrategiesRouter from "./routes/feeStrategies";
 import { ipBlacklistMiddleware } from "./middleware/ipBlacklist";
 import { providerLogMaskingMiddleware } from "./middleware/providerLogMasking";
+import { sanitizationMiddleware } from "./middleware/sanitization";
 import crossChainRouter from "./routes/crossChain";
 import stellarRouter from "./routes/stellar";
 import reconciliationRoutes from "./routes/reconciliation";
@@ -214,6 +217,7 @@ app.use(
     extended: true,
   }),
 );
+app.use(sanitizationMiddleware);
 // app.use(rateLimitMiddleware);
 app.use(responseTime);
 app.use(requestId);
@@ -430,6 +434,8 @@ app.use("/api/v1/disputes", disputeRoutesV1);
 app.use("/api/v1/stats", statsRoutesV1);
 app.use("/api/v1/vaults", vaultRoutesV1);
 app.use("/api/v1/compliance/travel-rule", travelRuleRoutes);
+app.use("/api/v1/compliance", complianceRoutes);
+app.use("/api/admin", makerCheckerRoutes);
 
 app.use(
   "/api/transactions",
@@ -488,6 +494,7 @@ app.use("/", paymentLinkRoutes);
 app.use("/api/gdpr", privacyRoutes);
 app.use("/api/developer", developerDashboardRoutes);
 app.use("/api/admin", requireAuth, adminRoutes);
+app.use("/api/v1/admin", requireAuth, adminRoutes);
 app.use("/api/admin/providers/status", requireAuth, providerStatusRouter);
 app.use("/api/admin/kyc-upgrades", requireAuth, kycTierUpgradeRoutes);
 app.use("/api/admin/auth", createAdminSep10Router());

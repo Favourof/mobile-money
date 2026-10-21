@@ -54,11 +54,45 @@ import { resetCircuitBreakerForProvider } from "../utils/circuitBreaker";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { AuditLogFilter, AuditLogModel } from "../models/auditLog";
+import { sarReportService } from "../services/sarReportService";
 
 import adminControllerRouter from "../controllers/adminController";
 
 const router = Router();
 router.use("/monitoring", adminControllerRouter);
+
+/**
+ * POST /api/admin/compliance/sar/:userId
+ * One-click SAR export compiling customer profile, KYC links, transaction timeline, and audit logs.
+ */
+router.post(
+  "/compliance/sar/:userId",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { userId } = req.params;
+      const officer = (req as any).user;
+      const officerId = officer?.id || "compliance_officer_admin";
+      const { justification } = req.body || {};
+
+      const reportPackage = await sarReportService.generateSARDraft(
+        userId,
+        officerId,
+        {
+          justification,
+          ipAddress: req.ip,
+          userAgent: req.get("user-agent"),
+        },
+      );
+
+      res.status(200).json({
+        message: "SAR report package generated successfully",
+        report: reportPackage,
+      });
+    } catch (error: any) {
+      next(error);
+    }
+  },
+);
 const IMPERSONATION_TOKEN_EXPIRES_IN = "15m";
 const IMPERSONATION_TOKEN_TTL_MS = 15 * 60 * 1000;
 const READ_ONLY_IMPERSONATION_MESSAGE = "Read-only mode active";

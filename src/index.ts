@@ -30,6 +30,7 @@ import {
   transactionDisputeRoutesV1,
   transactionRoutesV1,
   vaultRoutesV1,
+  institutionalRoutesV1,
 } from "./routes/v1";
 import { quotesRouter } from "./routes/quotes";
 import { transactionRoutes } from "./routes/transactions";
@@ -452,6 +453,7 @@ app.use("/api/v1/disputes", disputeRoutesV1);
 app.use("/api/v1/stats", statsRoutesV1);
 app.use("/api/v1/vaults", vaultRoutesV1);
 app.use("/api/v1/compliance/travel-rule", travelRuleRoutes);
+app.use("/api/v1/institutional", institutionalRoutesV1);
 app.use("/api/v1/quotes", quotesRouter);
 
 app.use(

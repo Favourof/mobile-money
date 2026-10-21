@@ -42,6 +42,7 @@ import { runPartitionManagerJob } from "./partitionManager";
 import { withJobTrace } from "../queue/jobTracing";
 import { runKycRetentionPurgeJob } from "./kycRetentionPurgeJob";
 import { runRiskTierRecalculationJob } from "./riskTierRecalculationJob";
+import { runStellarBalanceMonitorJob } from "./stellarBalanceMonitorJob";
 
 interface JobConfig {
   name: string;
@@ -293,6 +294,14 @@ const JOBS: JobConfig[] = [
     schedule: process.env.KYC_RETENTION_PURGE_CRON || "30 3 * * *",
     timezone: "UTC",
     handler: runKycRetentionPurgeJob,
+  },
+  {
+    name: "stellar-balance-monitor",
+    // Every 2 minutes — polls Horizon for hot wallet / fee account XLM and
+    // asset balances; dispatches PagerDuty + Slack alerts on shortfall.
+    schedule: process.env.STELLAR_BALANCE_MONITOR_CRON || "*/2 * * * *",
+    timezone: "UTC",
+    handler: runStellarBalanceMonitorJob,
   },
   {
     name: "risk-tier-recalculation",

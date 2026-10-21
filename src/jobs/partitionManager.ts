@@ -45,6 +45,11 @@ export async function countDefaultPartitionRows(): Promise<number> {
 }
 
 export async function runPartitionManagerJob(): Promise<void> {
+  logger.info(
+    { monthsAhead: AUDIT_LOG_PARTITION_MONTHS_AHEAD },
+    "[PartitionManager] Ensuring audit_logs partitions",
+  );
+
   try {
     const created = await ensureAuditLogPartitions();
     if (created.length > 0) {
@@ -53,7 +58,10 @@ export async function runPartitionManagerJob(): Promise<void> {
         "[PartitionManager] Created audit_logs partitions",
       );
     } else {
-      logger.debug("[PartitionManager] audit_logs partitions already present");
+      logger.debug(
+        { monthsAhead: AUDIT_LOG_PARTITION_MONTHS_AHEAD },
+        "[PartitionManager] audit_logs partitions already present — nothing to create",
+      );
     }
   } catch (error) {
     logger.error(
@@ -68,9 +76,12 @@ export async function runPartitionManagerJob(): Promise<void> {
     if (defaultRows > 0) {
       logger.warn(
         { defaultRows },
-        "[PartitionManager] audit_logs DEFAULT partition holds rows outside every monthly range; " +
-          "their months cannot be partitioned until the rows are moved",
+        "[PartitionManager] audit_logs DEFAULT partition (audit_logs_legacy) holds rows " +
+          "outside every monthly range — these rows will not benefit from partition pruning. " +
+          "Run 20261020_migrate_audit_logs_to_monthly_partitions to relocate them.",
       );
+    } else {
+      logger.debug("[PartitionManager] audit_logs DEFAULT partition is empty — all clear");
     }
   } catch (error) {
     logger.error(

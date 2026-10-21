@@ -6,6 +6,7 @@ import { UserModel } from "../models/users";
 import { pool } from "../config/database";
 import { encryptAES, decryptAES, deriveKey } from "../utils/encryption";
 import { env } from "../config/env";
+import { amlVelocityService } from "../services/amlVelocityService";
 
 const amlAlertModel = new AMLAlertModel();
 const transactionModel = new TransactionModel();
@@ -261,13 +262,87 @@ export const reviewAmlAlert = async (
       return;
     }
 
+    // A dismissed (false-positive) alert releases a transaction held in
+    // PENDING_REVIEW, unless another alert on it is still awaiting review.
+    let released = false;
+    if (status === "dismissed") {
+      const open = await pool.query(
+        `SELECT 1 FROM aml_alerts
+         WHERE transaction_id = $1 AND status = 'pending_review' AND id <> $2
+         LIMIT 1`,
+        [updated.transactionId, alertId],
+      );
+      if (open.rowCount === 0) {
+        released = await amlVelocityService.resolveHold(
+          updated.transactionId,
+          "release",
+          req.jwtUser.userId,
+        );
+      }
+    }
+
     res.json({
       message: "AML alert reviewed successfully",
       alert: updated,
+      transactionReleased: released,
     });
   } catch (error) {
     logger.error("Failed to review AML alert:", error);
     res.status(500).json({ error: "Failed to review AML alert" });
+  }
+};
+
+/**
+ * Release or reject a transaction held in PENDING_REVIEW by AML velocity monitoring
+ * POST /api/audit/aml/alerts/:alertId/hold
+ * Body: { decision: "release" | "reject" }
+ */
+export const resolveHeldTransaction = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const { alertId } = req.params;
+    const { decision } = req.body;
+
+    if (!req.jwtUser?.userId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+
+    if (decision !== "release" && decision !== "reject") {
+      res.status(400).json({
+        error: "Invalid decision",
+        message: "decision must be one of: release, reject",
+      });
+      return;
+    }
+
+    const alert = await amlAlertModel.findById(alertId);
+    if (!alert) {
+      res.status(404).json({ error: "AML alert not found" });
+      return;
+    }
+
+    const resolved = await amlVelocityService.resolveHold(
+      alert.transactionId,
+      decision,
+      req.jwtUser.userId,
+    );
+    if (!resolved) {
+      res.status(409).json({
+        error: "Transaction is not in pending_review",
+      });
+      return;
+    }
+
+    res.json({
+      message: `Held transaction ${decision === "release" ? "released" : "rejected"}`,
+      transactionId: alert.transactionId,
+    });
+  } catch (error) {
+    logger.error("Failed to resolve held transaction:", error);
+    res.status(500).json({ error: "Failed to resolve held transaction" });
   }
 };
 

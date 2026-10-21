@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { recordAdminAction } from "../services/auditLogger";
 
 const router = Router();
 
@@ -125,6 +126,11 @@ export const logAudit = (
     ...details,
   });
 };
+
+const extractRequestMeta = (req: Request) => ({
+  ipAddress: req.ip ?? null,
+  userAgent: req.get("user-agent") ?? null,
+});
 
 const generateId = () =>
   Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -320,7 +326,7 @@ router.post("/actions", requireAdmin, (req: Request, res: Response) => {
 router.post(
   "/actions/bulk/approve",
   requireAdmin,
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const checker = (req as AuthRequest).user!;
     const { checker_note, justification } = req.body;
 
@@ -338,6 +344,7 @@ router.post(
     }
 
     const results: BulkMakerCheckerResult[] = [];
+    const requestMeta = extractRequestMeta(req);
 
     for (const actionId of actionIds) {
       try {
@@ -374,7 +381,7 @@ router.post(
 router.post(
   "/actions/bulk/reject",
   requireAdmin,
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const checker = (req as AuthRequest).user!;
     const { checker_note, justification } = req.body;
 
@@ -392,6 +399,7 @@ router.post(
     }
 
     const results: BulkMakerCheckerResult[] = [];
+    const requestMeta = extractRequestMeta(req);
 
     for (const actionId of actionIds) {
       try {
@@ -451,7 +459,7 @@ router.get("/actions/:id", requireAdmin, (req: Request, res: Response) => {
 router.post(
   "/actions/:id/approve",
   requireAdmin,
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const checker = (req as AuthRequest).user!;
     const { checker_note, justification } = req.body;
 
@@ -481,7 +489,7 @@ router.post(
 router.post(
   "/actions/:id/reject",
   requireAdmin,
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const checker = (req as AuthRequest).user!;
     const { checker_note, justification } = req.body;
 

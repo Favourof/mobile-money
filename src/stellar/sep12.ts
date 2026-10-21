@@ -1,5 +1,5 @@
 import logger from "../utils/logger";
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { Pool } from "pg";
 import { sep12RateLimiter } from "../middleware/rateLimit";
 import { upload } from "../middleware/upload";
@@ -19,12 +19,20 @@ import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { UserModel } from "../models/users";
 import { CustomerDataMaskingService } from "../services/customerDataMaskingService";
-import { createDeleteCustomerHandler } from "../routes/sep12";
+import {
+  createDeleteCustomerHandler,
+  sep12DocumentUploadMiddleware,
+} from "../routes/sep12";
 import {
   kycSanitizeBody,
   sanitizeKycPayload,
   sanitizeKycString,
 } from "../validators/kycSanitizer";
+import {
+  CustomerService,
+  defaultCustomerService,
+  customerEvents,
+} from "../services/customerService";
 
 /**
  * SEP-12: KYC API
@@ -72,6 +80,7 @@ export interface Sep12CustomerFields {
   photo_id_front?: string; // Base64 or URL
   photo_id_back?: string;
   photo_proof_residence?: string;
+  biometric_photo?: string; // Live photo used for face-match verification
 
   // Organization fields (for businesses)
   organization_name?: string;
@@ -139,6 +148,7 @@ const PutCustomerSchema = z.object({
   photo_id_front: z.string().optional(),
   photo_id_back: z.string().optional(),
   photo_proof_residence: z.string().optional(),
+  biometric_photo: z.string().optional(),
   
   // Organization
   organization_name: z.string().optional(),
@@ -162,11 +172,13 @@ export class Sep12Service {
   private kycService: KYCService;
   private db: Pool;
   private userModel: UserModel;
+  public customerService: CustomerService;
 
-  constructor(db: Pool) {
+  constructor(db: Pool, customerService?: CustomerService) {
     this.db = db;
     this.kycService = new KYCService(db);
     this.userModel = new UserModel();
+    this.customerService = customerService || defaultCustomerService;
   }
 
   /**
@@ -460,6 +472,7 @@ export class Sep12Service {
         photo_id_front,
         photo_id_back,
         photo_proof_residence,
+        biometric_photo,
         organization_name: rawOrganizationName,
         organization_registration_number: rawOrganizationRegNumber,
         organization_registration_date,
@@ -611,6 +624,17 @@ export class Sep12Service {
         });
       }
 
+      if (biometric_photo) {
+        if (!applicantId) {
+          throw new Error("applicantId is required for face-match verification");
+        }
+        await this.kycService.submitFaceMatch({
+          applicantId,
+          biometricPayload: biometric_photo,
+          filename: `biometric_${Date.now()}.jpg`,
+        });
+      }
+
       // Process dynamic custom fields/documents attached
       for (const [key, value] of Object.entries(customFields)) {
         if (typeof value === "string" && value.length > 500) {
@@ -735,19 +759,11 @@ export const createSep12Router = (db: Pool): Router => {
   router.put(
     "/customer",
     sep12Limiter,
-    upload.any(),
+    sep12DocumentUploadMiddleware,
     kycSanitizeBody,
     async (req: Request, res: Response) => {
       try {
         const customerData = { ...req.body };
-
-        // Support multipart upload: parse custom documents and map as base64 fields so KYC validation parses them
-        if (req.files && Array.isArray(req.files)) {
-          req.files.forEach((file: any) => {
-            customerData[file.fieldname] = file.buffer.toString("base64");
-          });
-        }
-
         const customer = await sep12Service.putCustomer(customerData);
         res.json(customer);
       } catch (error: any) {
@@ -776,4 +792,5 @@ export const createSep12Router = (db: Pool): Router => {
   return router;
 };
 
+export { CustomerService, defaultCustomerService, customerEvents };
 export default createSep12Router;

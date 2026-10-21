@@ -1,6 +1,6 @@
 import type { Application } from "express";
 import express from "express";
-import compression from "compression";
+import { compressionMiddleware } from "../middleware/compression";
 import session from "express-session";
 import { applySecurityMiddleware } from "./express";
 import { getSessionCookieOptions, getSessionTrustProxy } from "./session";

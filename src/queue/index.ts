@@ -27,8 +27,10 @@ import {
   startReceivingAnchorWebhookWorker,
 } from "./receivingAnchorWebhookWorker";
 import { closeReceivingAnchorWebhookQueue } from "../services/webhookService";
+import { stopRedisBackpressureMonitor } from "./redisBackpressure";
 
 export async function shutdownQueue(): Promise<void> {
+  stopRedisBackpressureMonitor();
   await Promise.all([
     closeWorker().catch(() => undefined),
     closeSyncWorker().catch(() => undefined),
@@ -45,6 +47,8 @@ export async function shutdownQueue(): Promise<void> {
 export {
   transactionQueue,
   addTransactionJob,
+  addTransactionToQueue,
+  calculateTransactionPriority,
   getJobById,
   getJobProgress,
   getQueueStats,
@@ -52,6 +56,13 @@ export {
   resumeQueue,
   drainQueue,
 } from "./transactionQueue";
+export {
+  startRedisBackpressureMonitor,
+  stopRedisBackpressureMonitor,
+  redisBackpressureGuard,
+  isBackpressureActive,
+  getBackpressureState,
+} from "./redisBackpressure";
 export type {
   TransactionJobData,
   TransactionJobResult,
@@ -67,7 +78,7 @@ export type { SyncJobData, SyncJobResult } from "./syncQueue";
 
 export { transactionWorker, closeWorker };
 export { syncWorker, closeSyncWorker };
-export { createQueueDashboard } from "./dashboard";
+export { createQueueDashboard, createDashboardAuthMiddleware } from "./dashboard";
 export {
   getQueueHealth,
   pauseQueueEndpoint,
@@ -81,6 +92,7 @@ export {
 
 export { queueOptions } from "./config";
 export { deadLetterQueue, DLQ_NAME, capturePersistentFailure } from "./dlq";
+export { startDlqMonitor, stopDlqMonitor, replayDlqJob } from "./dlqWorker";
 export { startProviderBalanceAlertWorker, scheduleProviderBalanceAlertJob };
 
 // Accounting Retry Queue Exports
@@ -151,3 +163,16 @@ export {
   childLoggerWithTrace,
   TRACE_ID_KEY,
 } from "./trace";
+
+// Customer KYC Callback Queue Exports
+export {
+  CUSTOMER_CALLBACK_QUEUE_NAME,
+  customerCallbackQueue,
+  enqueueCustomerCallback,
+  deliverCustomerCallback,
+  customerCallbackWorker,
+  startCustomerCallbackWorker,
+  closeCustomerCallbackWorker,
+  closeCustomerCallbackQueue,
+} from "./customerCallbackQueue";
+export type { CustomerCallbackJobData } from "./customerCallbackQueue";

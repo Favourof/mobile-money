@@ -14,9 +14,11 @@ import {
   patchMetadataHandler,
   deleteMetadataKeysHandler,
   searchByMetadataHandler,
+  batchStatusHandler,
 } from "../../controllers/transactionController";
 import { validateNetworkMiddleware } from "../../middleware/validateNetworkMiddleware";
 import { TimeoutPresets, haltOnTimedout } from "../../middleware/timeout";
+import { RequestTimeoutPresets } from "../../middleware/requestTimeout";
 import { validateTransactionFilters } from "../../utils/transactionFilters";
 import { requireAuth } from "../../middleware/auth";
 import { checkAccountStatusStrict } from "../../middleware/checkAccountStatus";
@@ -97,6 +99,15 @@ transactionRoutesV1.patch(
     next();
   },
   reviewAmlAlertHandler,
+);
+
+// Bulk transaction status lookup (up to 50 IDs per request)
+transactionRoutesV1.post(
+  "/batch-status",
+  requireAuth,
+  RequestTimeoutPresets.complexBatch,
+  setApiVersion("v1"),
+  batchStatusHandler,
 );
 
 // Get specific transaction

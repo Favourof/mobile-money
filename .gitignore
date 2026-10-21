@@ -37,6 +37,7 @@ pact.log
 # ── Load Test / Benchmark Output ─────────────────
 tests/load/results/*.json
 benchmarks/results/*.json
+benchmarks/results/*.html
 
 # ── Environment & Secrets ─────────────────────────
 .env
@@ -83,6 +84,11 @@ test-results/
 *.tmp
 *.temp
 .cache/
+
+# ── Python ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
 
 # ── Soroban deployment config (may reference admin keys) ──
 config/contracts.json

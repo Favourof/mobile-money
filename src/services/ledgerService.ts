@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, PoolClient } from "pg";
 import { pool } from "../config/database";
 import { SupportedCurrency, currencyService, BASE_CURRENCY } from "./currency";
 import { UserModel } from "../models/users";
@@ -178,6 +178,80 @@ export const decodeLedgerEntryCursor = (cursor: string): LedgerEntryCursor => {
     throw new Error("Invalid ledger entry cursor");
   }
 };
+
+// ---------------------------------------------------------------------------
+// Customer wallet balances with optimistic locking (#2291)
+// ---------------------------------------------------------------------------
+
+/** Retries after the first attempt when a wallet version conflict occurs. */
+export const WALLET_UPDATE_MAX_RETRIES = 3;
+
+export interface CustomerWallet {
+  id: string;
+  user_id: string;
+  currency: string;
+  /** Decimal string, exactly as stored (DECIMAL(20,7)). */
+  balance: string;
+  version: number;
+}
+
+/**
+ * The wallet changed between our read and our write (its version moved on).
+ * Thrown once retries are exhausted; the caller may retry the whole request.
+ */
+export class ConcurrentModificationError extends Error {
+  constructor(
+    readonly userId: string,
+    readonly currency: string,
+    readonly attempts: number,
+  ) {
+    super(
+      `Wallet ${userId}/${currency} was modified concurrently; gave up after ${attempts} attempt(s)`,
+    );
+    this.name = "ConcurrentModificationError";
+  }
+}
+
+export class InsufficientFundsError extends Error {
+  constructor(
+    readonly userId: string,
+    readonly currency: string,
+    readonly balance: string,
+    readonly requested: string,
+  ) {
+    super(
+      `Insufficient funds in wallet ${userId}/${currency}: balance ${balance}, requested ${requested}`,
+    );
+    this.name = "InsufficientFundsError";
+  }
+}
+
+export class WalletNotFoundError extends Error {
+  constructor(
+    readonly userId: string,
+    readonly currency: string,
+  ) {
+    super(`No ${currency} wallet for user ${userId}`);
+    this.name = "WalletNotFoundError";
+  }
+}
+
+const DECIMAL_AMOUNT_PATTERN = /^\d{1,13}(\.\d{1,7})?$/;
+
+/**
+ * Validate an amount and return it as a decimal string. Strings are preferred
+ * so no float rounding touches the value; numbers are accepted for
+ * convenience and must already fit the column's 7 decimal places.
+ */
+function toWalletAmount(amount: string | number): string {
+  const text = typeof amount === "number" ? String(amount) : amount.trim();
+  if (!DECIMAL_AMOUNT_PATTERN.test(text) || /^0+(\.0+)?$/.test(text)) {
+    throw new Error(`Invalid wallet amount: ${amount}`);
+  }
+  return text;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class LedgerService {
   private pool: Pool;
@@ -544,6 +618,108 @@ export class LedgerService {
       entries,
       transactionId,
     );
+  }
+
+  /**
+   * Fetch a customer's wallet for one currency, or null if none exists.
+   */
+  async getWallet(
+    userId: string,
+    currency: string,
+  ): Promise<CustomerWallet | null> {
+    const result = await this.pool.query<CustomerWallet>(
+      `SELECT id, user_id, currency, balance::text AS balance, version
+         FROM customer_wallets
+        WHERE user_id = $1 AND currency = $2`,
+      [userId, currency],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  /**
+   * Deduct `amount` from a customer's wallet. Safe under concurrent
+   * withdrawals: see applyWalletDelta.
+   *
+   * @throws InsufficientFundsError, WalletNotFoundError,
+   *         ConcurrentModificationError (after WALLET_UPDATE_MAX_RETRIES)
+   */
+  async debitWallet(
+    userId: string,
+    currency: string,
+    amount: string | number,
+    client?: PoolClient,
+  ): Promise<CustomerWallet> {
+    return this.applyWalletDelta(userId, currency, amount, -1, client);
+  }
+
+  /** Add `amount` to a customer's wallet (optimistically locked). */
+  async creditWallet(
+    userId: string,
+    currency: string,
+    amount: string | number,
+    client?: PoolClient,
+  ): Promise<CustomerWallet> {
+    return this.applyWalletDelta(userId, currency, amount, 1, client);
+  }
+
+  /**
+   * Optimistic-locking read-modify-write of a wallet balance.
+   *
+   * 1. Read the balance and its `version`, and decide sufficiency against
+   *    that snapshot.
+   * 2. `UPDATE ... SET version = version + 1 WHERE id = $id AND version = $read`.
+   *    If another writer committed in between, the version no longer matches,
+   *    no row is updated, and nothing is written based on a stale balance.
+   * 3. On such a conflict, back off briefly and retry from step 1, up to
+   *    WALLET_UPDATE_MAX_RETRIES times, then throw ConcurrentModificationError.
+   *
+   * Pass `client` to run inside a caller's transaction. Use READ COMMITTED
+   * (the default): under REPEATABLE READ a retry would re-read the same
+   * snapshot, and Postgres raises a serialization error instead.
+   */
+  private async applyWalletDelta(
+    userId: string,
+    currency: string,
+    amount: string | number,
+    sign: 1 | -1,
+    client?: PoolClient,
+  ): Promise<CustomerWallet> {
+    const value = toWalletAmount(amount);
+    const db = client ?? this.pool;
+    const maxAttempts = WALLET_UPDATE_MAX_RETRIES + 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const read = await db.query<CustomerWallet & { sufficient: boolean }>(
+        `SELECT id, user_id, currency, balance::text AS balance, version,
+                balance + ($3::numeric * $4) >= 0 AS sufficient
+           FROM customer_wallets
+          WHERE user_id = $1 AND currency = $2`,
+        [userId, currency, value, sign],
+      );
+      const wallet = read.rows[0];
+      if (!wallet) throw new WalletNotFoundError(userId, currency);
+      if (!wallet.sufficient) {
+        throw new InsufficientFundsError(userId, currency, wallet.balance, value);
+      }
+
+      const updated = await db.query<CustomerWallet>(
+        `UPDATE customer_wallets
+            SET balance    = balance + ($2::numeric * $3),
+                version    = version + 1,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1 AND version = $4
+          RETURNING id, user_id, currency, balance::text AS balance, version`,
+        [wallet.id, value, sign, wallet.version],
+      );
+      if (updated.rowCount === 1) return updated.rows[0];
+
+      if (attempt < maxAttempts) {
+        // Jittered backoff so colliding writers don't retry in lockstep.
+        await sleep(Math.random() * 10 * attempt);
+      }
+    }
+
+    throw new ConcurrentModificationError(userId, currency, maxAttempts);
   }
 
   /**

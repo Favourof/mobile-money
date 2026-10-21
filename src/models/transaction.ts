@@ -4,6 +4,7 @@ import { encrypt, decrypt } from "../utils/encryption";
 import { WebSocketManager } from "../websocket";
 import { getRedisPubSub } from "../graphql/redisPubSub";
 import { CachedTransactionInvalidation } from "../services/cachedTransactionService";
+import { publishTransactionEvent } from "../services/transactionEventStream";
 import {
   SubscriptionChannels,
   transactionChannel,
@@ -19,6 +20,11 @@ export enum TransactionStatus {
   Failed = "failed",
   Cancelled = "cancelled",
   Review = "review",
+  /**
+   * Held before provider dispatch by AML velocity monitoring until a
+   * compliance officer releases (back to Pending) or rejects (Cancelled) it.
+   */
+  PendingReview = "pending_review",
   Dispute = "dispute",
   Reversed = "reversed",
   ClawedBack = "clawed_back",
@@ -275,7 +281,14 @@ export const ALLOWED_STATUS_TRANSITIONS: Record<
     TransactionStatus.Failed,
     TransactionStatus.Cancelled,
     TransactionStatus.Review,
+    TransactionStatus.PendingReview,
     TransactionStatus.Expired,
+  ],
+  [TransactionStatus.PendingReview]: [
+    TransactionStatus.PendingReview,
+    TransactionStatus.Pending,
+    TransactionStatus.Cancelled,
+    TransactionStatus.Failed,
   ],
   [TransactionStatus.Processing]: [
     TransactionStatus.Processing,
@@ -303,9 +316,7 @@ export const ALLOWED_STATUS_TRANSITIONS: Record<
     TransactionStatus.Failed,
     TransactionStatus.Review,
   ],
-  [TransactionStatus.Cancelled]: [
-    TransactionStatus.Cancelled,
-  ],
+  [TransactionStatus.Cancelled]: [TransactionStatus.Cancelled],
   [TransactionStatus.Dispute]: [
     TransactionStatus.Dispute,
     TransactionStatus.Completed,
@@ -313,12 +324,8 @@ export const ALLOWED_STATUS_TRANSITIONS: Record<
     TransactionStatus.ClawedBack,
     TransactionStatus.Failed,
   ],
-  [TransactionStatus.Reversed]: [
-    TransactionStatus.Reversed,
-  ],
-  [TransactionStatus.ClawedBack]: [
-    TransactionStatus.ClawedBack,
-  ],
+  [TransactionStatus.Reversed]: [TransactionStatus.Reversed],
+  [TransactionStatus.ClawedBack]: [TransactionStatus.ClawedBack],
   [TransactionStatus.Expired]: [
     TransactionStatus.Expired,
     TransactionStatus.Failed,
@@ -423,6 +430,14 @@ export class TransactionModel {
 
     const transaction = mapTransactionRow(result.rows[0]);
 
+    // Initial status event for SSE subscribers watching the transaction.
+    publishTransactionEvent({
+      transactionId: transaction.id,
+      userId: data.userId ?? undefined,
+      status: transaction.status,
+      timestamp: new Date(transaction.createdAt).getTime(),
+    });
+
     // Invalidate caches after successful transaction creation.
     if (data.userId) {
       await Promise.resolve(
@@ -469,6 +484,28 @@ export class TransactionModel {
 
     const res = await queryRead<TransactionRow>(q, params);
     return mapTransactionRow(res.rows[0]);
+  }
+
+  /**
+   * Fetch multiple transactions by ID in a single query, for callers
+   * reconciling a batch of transactions (e.g. `POST
+   * /transactions/batch-status`) without issuing one round trip per ID.
+   * IDs with no matching transaction are simply absent from the result —
+   * callers that need a per-ID outcome diff the input against the result.
+   */
+  async findByIds(ids: string[], userId?: string): Promise<Transaction[]> {
+    if (!ids.length) return [];
+
+    let q = `SELECT ${TRANSACTION_SELECT_COLUMNS} FROM transactions WHERE id = ANY($1)`;
+    const params: (string[] | string)[] = [ids];
+
+    if (userId) {
+      q += ` AND user_id=$2`;
+      params.push(userId);
+    }
+
+    const res = await queryRead<TransactionRow>(q, params);
+    return res.rows.map(mapTransactionRow).filter((t): t is Transaction => t !== null);
   }
 
   async updateStatus(
@@ -533,6 +570,16 @@ export class TransactionModel {
         );
       });
     }
+
+    // ── Publish to the SSE transaction stream ───────────────────────────
+    // Buffered in the replay ring buffer so clients reconnecting with
+    // Last-Event-ID still receive status changes made while offline.
+    publishTransactionEvent({
+      transactionId: id,
+      userId: row.user_id ?? undefined,
+      status,
+      timestamp: new Date(row.updated_at ?? Date.now()).getTime(),
+    });
 
     // ── Publish GraphQL subscription event ──────────────────────────────
     // Publish to both the per-transaction channel (targeted) and the
@@ -782,6 +829,35 @@ export class TransactionModel {
       `SELECT ${TRANSACTION_SELECT_COLUMNS}
        FROM transactions
        WHERE reference_number = $1
+       LIMIT 1`,
+      [trimmed],
+    );
+
+    return mapTransactionRow(result.rows[0]);
+  }
+
+  /**
+   * Looks up a transaction by the provider's own reference (e.g. an M-Pesa
+   * B2C `ConversationID`/`OriginatorConversationID`, stored on initiation as
+   * `providerReference`). Used by provider result-webhook routes that only
+   * receive the provider's identifiers, not our internal transaction id.
+   */
+  async findByProviderReference(
+    providerReference: string,
+  ): Promise<Transaction | null> {
+    if (
+      !providerReference ||
+      typeof providerReference !== "string" ||
+      !providerReference.trim()
+    ) {
+      return null;
+    }
+
+    const trimmed = providerReference.trim();
+    const result = await queryRead<TransactionRow>(
+      `SELECT ${TRANSACTION_SELECT_COLUMNS}
+       FROM transactions
+       WHERE provider_reference = $1
        LIMIT 1`,
       [trimmed],
     );

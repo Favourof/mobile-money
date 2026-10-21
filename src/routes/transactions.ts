@@ -1,4 +1,5 @@
 import logger from "../utils/logger";
+import { redisBackpressureGuard } from "../queue/redisBackpressure";
 import { Router, Request, Response } from "express";
 import {
   cancelTransactionHandler,
@@ -29,6 +30,7 @@ import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
 import { complianceMiddlewares } from "../middleware/compliance";
 import { strictIdempotency } from "../middleware/idempotency";
+import { attachTransactionStream } from "../services/transactionEventStream";
 
 export const transactionRoutes = Router();
 transactionRoutes.use(createExportRoutes());
@@ -100,7 +102,11 @@ transactionRoutes.get(
         return res.status(404).json({ error: "Transaction not found" });
 
       if (transaction.userId !== req.jwtUser?.userId) {
-        return res.status(403).json({ error: "You do not have permission to access this transaction" });
+        return res
+          .status(403)
+          .json({
+            error: "You do not have permission to access this transaction",
+          });
       }
 
       if (transaction.status !== TransactionStatus.Completed)
@@ -238,6 +244,7 @@ transactionRoutes.patch(
 transactionRoutes.post(
   "/deposit",
   authenticateToken,
+  redisBackpressureGuard,
   strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
@@ -250,6 +257,7 @@ transactionRoutes.post(
 transactionRoutes.post(
   "/withdraw",
   authenticateToken,
+  redisBackpressureGuard,
   strictIdempotency,
   TimeoutPresets.long,
   haltOnTimedout,
@@ -259,6 +267,47 @@ transactionRoutes.post(
   validate2FAForWithdrawal,
   withdrawHandler,
 );
+
+// Live transaction progress over Server-Sent Events. Clients reconnecting
+// with a `Last-Event-ID` header are replayed the events they missed from the
+// bounded ring buffer before live delivery resumes.
+transactionRoutes.get("/stream", authenticateToken, async (req, res) => {
+  const userId = req.jwtUser?.userId;
+  if (!userId) {
+    res
+      .status(401)
+      .json({ error: "Access denied", message: "No token provided" });
+    return;
+  }
+
+  const rawTransactionId = req.query.transactionId;
+  const transactionId =
+    typeof rawTransactionId === "string" && rawTransactionId.trim()
+      ? rawTransactionId.trim()
+      : undefined;
+
+  if (transactionId) {
+    try {
+      const transaction = await transactionModel.findById(transactionId);
+      if (!transaction) {
+        res.status(404).json({ error: "Transaction not found" });
+        return;
+      }
+      if (transaction.userId !== userId) {
+        res.status(403).json({
+          error: "You do not have permission to access this transaction",
+        });
+        return;
+      }
+    } catch (err) {
+      logger.error("Failed to load transaction for SSE stream:", err);
+      res.status(500).json({ error: "Failed to open transaction stream" });
+      return;
+    }
+  }
+
+  attachTransactionStream(req, res, { userId, transactionId });
+});
 
 transactionRoutes.get(
   "/:id",

@@ -1,3 +1,4 @@
+import { ipReputationService } from "../services/ipReputation";
 import logger from "../utils/logger";
 import { Router, Request, Response } from "express";
 import { sep31RateLimiter } from "../middleware/rateLimit";
@@ -7,6 +8,9 @@ import { getConfiguredPaymentAsset } from "../services/stellar/assetService";
 import rateLimit from "express-rate-limit";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { validateRequest } from "../middleware/validation";
+import { createSep31TransactionSchema } from "../schemas/sep31";
+import { z } from "zod";
 
 import { pool } from "../config/database";
 import { sanctionService } from "../services/sanctionService";
@@ -20,6 +24,43 @@ import { strictIdempotency } from "../middleware/idempotency";
 
 const router = Router();
 const transactionModel = new TransactionModel();
+
+// ─── Fee calculation ─────────────────────────────────────────────────────────
+
+interface FeeOptions {
+  providerProcessingFee?: number;
+  fxConversionMarginPercent?: number;
+}
+
+interface FeeResult {
+  fee: number;
+  total: number;
+  feeDetails: {
+    providerProcessingFee: number;
+    fxConversionFee: number;
+  };
+}
+
+/**
+ * Calculates the total fee and gross-up amount for a SEP-31 transaction.
+ *
+ * @param amount - The send amount (in source-asset units) as a numeric value
+ * @param options - Optional fee configuration overrides
+ */
+function calculateFee(amount: number, options: FeeOptions = {}): FeeResult {
+  const providerProcessingFee = options.providerProcessingFee ?? 0;
+  const fxMargin = options.fxConversionMarginPercent ?? 0;
+  const fxConversionFee = amount * (fxMargin / 100);
+  const fee = providerProcessingFee + fxConversionFee;
+  return {
+    fee,
+    total: amount + fee,
+    feeDetails: {
+      providerProcessingFee,
+      fxConversionFee,
+    },
+  };
+}
 
 // --- SEP-31 Status State Machine ---
 // Valid statuses per SEP-31 spec
@@ -142,12 +183,6 @@ function parseAssetCode(rawCode: string): string {
   return rawCode;
 }
 
-function calculateFee(amount: number): { fee: number; total: number } {
-  let fee = SEP31_CONFIG.feeFixed + (amount * SEP31_CONFIG.feePercent) / 100;
-  fee = parseFloat(fee.toFixed(7));
-  return { fee, total: parseFloat((amount + fee).toFixed(7)) };
-}
-
 function generateMemo(): string {
   // Generate a short unique memo (max 28 chars for Stellar text memo)
   return crypto.randomUUID().replace(/-/g, "").substring(0, 28);
@@ -228,6 +263,18 @@ router.post(
   sep31WriteLimiter,
   strictIdempotency,
   async (req: Request, res: Response) => {
+    const ip = req.ip || req.connection.remoteAddress || "0.0.0.0";
+    const risk = await ipReputationService.checkIP(ip);
+    if (risk.isTorExitNode) {
+      throw createError(
+        ERROR_CODES.UNAUTHORIZED,
+        "High risk IP detected: Tor Exit Node",
+        {
+          error: "High risk IP detected",
+        },
+      );
+    }
+
     const {
       amount,
       asset_code,
@@ -331,6 +378,93 @@ router.post(
       );
     }
 
+    // Descriptive SEP-31 error for missing corridor fields (#2263): a
+    // cross-border transfer needs a destination country to route and
+    // validate against, same as receiver_id/sender_id above.
+    const destinationCountryCode =
+      req.body.country_code || req.body.destination_country;
+    if (!destinationCountryCode) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        "Missing required corridor field: destination_country (or country_code)",
+        {
+          error: "invalid_request",
+          message:
+            "Missing required corridor field: destination_country (or country_code)",
+        },
+      );
+    }
+
+    // Strict KYC schema validation per country specifications (#1945)
+    const {
+      validateSep31KycFields,
+      validateReceiverPhoneCountryMatch,
+      validateSenderKycApproved,
+    } = await import("../validators/sep31.js");
+    const kycValidation = validateSep31KycFields(
+      fields,
+      finalSenderId,
+      finalReceiverId,
+      destinationCountryCode,
+    );
+    if (!kycValidation.valid) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        kycValidation.error || "Missing mandatory KYC compliance fields",
+        {
+          error: "invalid_request",
+          message:
+            kycValidation.error || "Missing mandatory KYC compliance fields",
+          details: {
+            missingSenderFields: kycValidation.missingSenderFields,
+            missingReceiverFields: kycValidation.missingReceiverFields,
+          },
+        },
+      );
+    }
+
+    // Receiver phone / destination country-code format validation (#2263)
+    const receiverMobileNumber =
+      txFields.receiver?.mobile_number ||
+      txFields.receiver_mobile_number ||
+      fields?.receiver?.mobile_number;
+    const phoneCountryValidation = validateReceiverPhoneCountryMatch(
+      receiverMobileNumber,
+      destinationCountryCode,
+    );
+    if (!phoneCountryValidation.valid) {
+      throw createError(
+        ERROR_CODES.INVALID_INPUT,
+        phoneCountryValidation.error ||
+          "Invalid receiver phone/country combination",
+        {
+          error: "invalid_request",
+          message:
+            phoneCountryValidation.error ||
+            "Invalid receiver phone/country combination",
+        },
+      );
+    }
+
+    // Sender SEP-12 KYC approval status (#2263)
+    const { UserModel } = await import("../models/users.js");
+    const userModel = new UserModel();
+    const senderKycValidation = await validateSenderKycApproved(
+      finalSenderId,
+      (id) => userModel.findById(id),
+    );
+    if (!senderKycValidation.valid) {
+      throw createError(
+        ERROR_CODES.UNAUTHORIZED,
+        senderKycValidation.error || "Sender KYC status is not approved",
+        {
+          error: "invalid_request",
+          message:
+            senderKycValidation.error || "Sender KYC status is not approved",
+        },
+      );
+    }
+
     if (!SEP31_CONFIG.receivingAccount) {
       logger.error("SEP-31: STELLAR_RECEIVING_ACCOUNT not configured");
       throw createError(
@@ -345,7 +479,10 @@ router.post(
 
     try {
       const memo = generateMemo();
-      const { fee, total } = calculateFee(parsedAmount);
+      const { fee, total, feeDetails } = calculateFee(parsedAmount, {
+        providerProcessingFee: SEP31_CONFIG.feeFixed,
+        fxConversionMarginPercent: SEP31_CONFIG.feePercent,
+      });
       const amountOut = parsedAmount; // Amount delivered to receiver (before payout fees)
 
       // --- Receiver-side AML Sanctions Screening ---
@@ -395,7 +532,8 @@ router.post(
             senderName: senderScreeningIdentifier,
             receiverName: receiverScreeningIdentifier,
             dailyVolumeUsd:
-              dailyVolumeUsd + (Number.isFinite(parsedAmount) ? parsedAmount : 0),
+              dailyVolumeUsd +
+              (Number.isFinite(parsedAmount) ? parsedAmount : 0),
           },
           { persistAudit: false },
         );
@@ -432,6 +570,7 @@ router.post(
           amount_in: total.toString(),
           amount_out: amountOut.toString(),
           amount_fee: fee.toString(),
+          fee_details: feeDetails,
           asset_code: cleanAssetCode,
           asset_issuer: configuredAsset.isNative()
             ? null
@@ -470,6 +609,7 @@ router.post(
               }
             : {}),
         },
+        ipRisk: risk,
       };
 
       const newTransaction = await transactionModel.create({
@@ -633,6 +773,14 @@ router.get(
         transaction.metadata,
       );
       const assetString = getAssetString();
+      const feeDetails = Array.isArray(sep31Meta.fee_details)
+        ? sep31Meta.fee_details
+        : [
+            {
+              description: "Transaction fee",
+              amount: sep31Meta.amount_fee || "0",
+            },
+          ];
 
       return res.json({
         transaction: {
@@ -649,6 +797,7 @@ router.get(
           amount_out_asset: assetString,
           amount_fee: sep31Meta.amount_fee || "0",
           amount_fee_asset: assetString,
+          fee_details: feeDetails,
           stellar_account_id: SEP31_CONFIG.receivingAccount,
           stellar_memo_type: sep31Meta.memo_type || "text",
           stellar_memo: sep31Meta.memo || "",

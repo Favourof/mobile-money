@@ -33,6 +33,11 @@ interface AirtelTokenResponse {
 import logger from "../../../utils/logger";
 import { maskPII } from "../../../utils/masking";
 import { formatPhoneForProvider } from "../../../utils/phoneUtils";
+import { attachCorrelationIdInterceptor } from "../../../utils/correlationIdInterceptor";
+import {
+  AirtelTokenManager,
+  calculateJitteredBackoff,
+} from "../airtelClient";
 
 // ============================================================================
 // TYPES & INTERFACES
@@ -102,6 +107,7 @@ interface AirtelProviderConfig {
   paymentPath: string;
   payoutPath: string;
   statusPath: string;
+  disbursementStatusPath: string;
   username: string;
   password: string;
   usernameField: string;
@@ -164,6 +170,7 @@ export class AirtelService {
   private session: AirtelSessionState | null = null;
   private sessionPromise: Promise<AirtelSessionState> | null = null;
   private readonly clock: () => number;
+  private tokenManager: AirtelTokenManager;
 
   constructor(
     regionOrOptions?: string | AirtelProviderOptions,
@@ -226,35 +233,62 @@ export class AirtelService {
     if (this.config.statusPath && !this.config.statusPath.startsWith(prefix)) {
       this.config.statusPath = `${prefix}${this.config.statusPath}`;
     }
+    if (
+      this.config.disbursementStatusPath &&
+      !this.config.disbursementStatusPath.startsWith(prefix)
+    ) {
+      this.config.disbursementStatusPath = `${prefix}${this.config.disbursementStatusPath}`;
+    }
 
     this.mode = this.resolveMode();
 
-    this.client =
-      opts.httpClient ??
-      axios.create({
+    if (opts.httpClient) {
+      this.client = opts.httpClient;
+    } else {
+      const client = axios.create({
         baseURL: this.config.webBaseUrl,
         timeout: this.config.requestTimeoutMs,
         maxRedirects: 0,
         validateStatus: () => true,
       });
+      attachCorrelationIdInterceptor(client);
+      this.client = client;
+    }
 
-    this.directClient =
-      opts.directHttpClient ??
-      axios.create({
+    if (opts.directHttpClient) {
+      this.directClient = opts.directHttpClient;
+    } else {
+      const directClient = axios.create({
         baseURL: this.config.directBaseUrl,
         timeout: this.config.requestTimeoutMs,
         validateStatus: () => true,
       });
+      attachCorrelationIdInterceptor(directClient);
+      this.directClient = directClient;
+    }
 
     if (this.config.proxyBaseUrl || opts.proxyHttpClient) {
-      this.proxyClient =
-        opts.proxyHttpClient ??
-        axios.create({
+      if (opts.proxyHttpClient) {
+        this.proxyClient = opts.proxyHttpClient;
+      } else {
+        const proxyClient = axios.create({
           baseURL: this.config.proxyBaseUrl,
           timeout: this.config.requestTimeoutMs,
           validateStatus: () => true,
         });
+        attachCorrelationIdInterceptor(proxyClient);
+        this.proxyClient = proxyClient;
+      }
     }
+
+    this.tokenManager = new AirtelTokenManager({
+      apiKey: this.apiKey,
+      apiSecret: this.apiSecret,
+      baseUrl: this.config.directBaseUrl,
+      clientId: this.apiKey || this.countryCode,
+      clock: this.clock,
+      httpClient: this.directClient as any,
+    });
 
     logger.info(
       { mode: this.mode, country: this.countryCode },
@@ -357,6 +391,10 @@ export class AirtelService {
         options.statusPath ??
         process.env.AIRTEL_STATUS_PATH ??
         "/standard/v1/payments/:reference",
+      disbursementStatusPath:
+        options.disbursementStatusPath ??
+        process.env.AIRTEL_DISBURSEMENT_STATUS_PATH ??
+        "/standard/v1/disbursements/:reference",
       username: options.username ?? process.env.AIRTEL_USERNAME ?? "",
       password: options.password ?? process.env.AIRTEL_PASSWORD ?? "",
       usernameField:
@@ -573,6 +611,41 @@ export class AirtelService {
         : this.checkStatusViaDirect(reference);
   }
 
+  /**
+   * Query Airtel's disbursement-specific status endpoint
+   * (`GET /standard/v1/disbursements/:reference`), as opposed to
+   * {@link getTransactionStatus}/{@link checkStatus} which query the general
+   * collections/payments status endpoint. Used by the disbursement
+   * reconciliation worker (#1955) to poll payouts whose webhook callback is
+   * delayed.
+   */
+  async getDisbursementStatus(
+    reference: string,
+  ): Promise<{ status: "completed" | "failed" | "pending" | "unknown" }> {
+    try {
+      const result = await this.checkDisbursementStatus(reference);
+      if (!result.success) return { status: "unknown" };
+      const txStatus = String(
+        (result.data as AirtelResponse)?.data?.transaction?.status ?? "",
+      ).toUpperCase();
+      // TS = success, TF = failed, TP = pending
+      if (txStatus === "TS") return { status: "completed" };
+      if (txStatus === "TF") return { status: "failed" };
+      if (txStatus === "TP") return { status: "pending" };
+      return { status: "unknown" };
+    } catch {
+      return { status: "unknown" };
+    }
+  }
+
+  async checkDisbursementStatus(reference: string) {
+    return this.mode === "proxy"
+      ? this.checkDisbursementStatusViaProxy(reference)
+      : this.mode === "web"
+        ? this.checkDisbursementStatusViaWebSession(reference)
+        : this.checkDisbursementStatusViaDirect(reference);
+  }
+
   async getOperationalBalance() {
     return this.mode === "proxy"
       ? this.getBalanceViaProxy()
@@ -586,41 +659,9 @@ export class AirtelService {
   // =========================================================================
 
   private async authenticateDirect(): Promise<string> {
-    if (this.token && this.clock() < this.tokenExpiry) {
-      return this.token;
-    }
-
-    const authHeader =
-      "Basic " +
-      Buffer.from(`${this.apiKey}:${this.apiSecret}`).toString("base64");
-
-    const response = await this.sendRequest(this.directClient, {
-      method: "POST",
-      url: "/auth/oauth2/token",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: authHeader,
-      },
-    });
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(
-        `Airtel direct auth failed with status ${response.status}`,
-      );
-    }
-
-    const data = this.getObjectResponseData<{
-      access_token?: string;
-      expires_in?: number;
-    }>(response);
-    if (!data?.access_token) {
-      throw new Error("Airtel direct auth did not return access_token");
-    }
-
-    this.token = data.access_token;
-    this.tokenExpiry = this.clock() + (data.expires_in ?? 3600) * 1000 - 5000;
-
-    return this.token;
+    const token = await this.tokenManager.getAccessToken();
+    this.token = token;
+    return token;
   }
 
   private async executeViaDirect(
@@ -696,11 +737,15 @@ export class AirtelService {
 
         if (response.status === 401 || response.status === 403) {
           this.token = null;
+          await this.tokenManager.invalidateToken();
           lastResponse = response;
           continue;
         }
 
-        if (response.status >= 500 && attempt < this.config.maxAttempts) {
+        if (
+          (response.status === 429 || response.status >= 500) &&
+          attempt < this.config.maxAttempts
+        ) {
           lastResponse = response;
           await this.delay(attempt);
           continue;
@@ -734,6 +779,16 @@ export class AirtelService {
     return this.toProviderResult(response, reference);
   }
 
+  private async checkDisbursementStatusViaDirect(
+    reference: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: unknown }> {
+    const response = await this.requestDirectWithRetry({
+      method: "GET",
+      url: this.formatPath(this.config.disbursementStatusPath, reference),
+    });
+
+    return this.toProviderResult(response, reference);
+  }
 
   private async getBalanceViaDirect(): Promise<{
     success: boolean;
@@ -1014,6 +1069,20 @@ export class AirtelService {
     return this.toProviderResult(response, reference);
   }
 
+  private async checkDisbursementStatusViaWebSession(
+    reference: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: unknown }> {
+    const response = await this.requestWithSessionAndRetry(
+      {
+        method: "GET",
+        url: this.formatPath(this.config.disbursementStatusPath, reference),
+      },
+      "payout",
+    );
+
+    return this.toProviderResult(response, reference);
+  }
+
   private async getBalanceViaWebSession(): Promise<{
     success: boolean;
     data?: { availableBalance: number; currency: string };
@@ -1139,6 +1208,24 @@ export class AirtelService {
     const response = await this.sendRequest(this.proxyClient, {
       method: "GET",
       url: this.formatPath(this.config.statusPath, reference),
+      headers: this.config.proxySecret
+        ? { "X-Airtel-Proxy-Secret": this.config.proxySecret }
+        : undefined,
+    });
+
+    return this.toProviderResult(response, reference);
+  }
+
+  private async checkDisbursementStatusViaProxy(
+    reference: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: unknown }> {
+    if (!this.proxyClient) {
+      throw new Error("Proxy client not configured");
+    }
+
+    const response = await this.sendRequest(this.proxyClient, {
+      method: "GET",
+      url: this.formatPath(this.config.disbursementStatusPath, reference),
       headers: this.config.proxySecret
         ? { "X-Airtel-Proxy-Secret": this.config.proxySecret }
         : undefined,
@@ -1434,6 +1521,7 @@ export class AirtelService {
   }
 
   private async delay(attempt: number): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    const jitteredMs = calculateJitteredBackoff(attempt, 200, 5000);
+    await new Promise((resolve) => setTimeout(resolve, Math.max(10, jitteredMs)));
   }
 }

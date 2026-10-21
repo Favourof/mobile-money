@@ -1837,6 +1837,20 @@ router.get(
   dlqInspectorHandler,
 );
 
+// Per-provider pause/resume for maintenance windows (#2282):
+//   POST /api/admin/queues/:provider/pause
+//   POST /api/admin/queues/:provider/resume
+//   GET  /api/admin/queues/:provider/status
+//   GET  /api/admin/queues/paused
+router.use(
+  "/queues",
+  requireAdmin,
+  createQueueControlRouter({
+    control: providerQueueControl,
+    audit: (entry) => auditService.logAdminAction(entry),
+  }),
+);
+
 /**
  * =========================
  * LIQUIDITY MANAGEMENT

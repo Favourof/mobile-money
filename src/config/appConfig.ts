@@ -6,7 +6,7 @@ import * as fs from "fs";
  * Centralized application configuration using Convict.
  * This system consolidates all hardcoded limits, provider configs, and app settings
  * into a single source of truth with environment-based overrides.
- * 
+ *
  * NOTE: Orange Money Cameroon configuration placeholders added for future corridor expansion.
  */
 
@@ -111,6 +111,32 @@ export const configSchema = convict({
       format: "nat",
       default: 5000000,
       env: "MAX_TRANSACTION_AMOUNT",
+    },
+  },
+
+  // SEP-24 Interactive Deposit/Withdrawal
+  sep24: {
+    interactiveSessionExpiryMinutes: {
+      doc:
+        "How long a SEP-24 interactive deposit/withdrawal session stays " +
+        "valid (from creation) before it is treated as expired and the " +
+        "interactive URL shows an expiration notice with a renewal option.",
+      format: "nat",
+      default: 15,
+      env: "SEP24_INTERACTIVE_SESSION_EXPIRY_MINUTES",
+    },
+  },
+
+  // SEP-38 Quotes & Price Streams
+  sep38: {
+    spreadMarginsByPair: {
+      doc:
+        "Per-currency-pair indicative-rate spread margin overrides, in basis points. " +
+        'JSON object keyed by "<SELL_CODE>_<BUY_CODE>" (e.g. {"XAF_USDC":15,"NGN_USDC":35}). ' +
+        "A pair not present here falls back to SEP38_SPREAD_BPS.",
+      format: String,
+      default: "{}",
+      env: "SEP38_SPREAD_MARGINS_BY_PAIR",
     },
   },
 
@@ -384,6 +410,56 @@ export const configSchema = convict({
         format: String,
         default: "",
         env: "WAVE_SN_API_KEY",
+      },
+    },
+    vodafoneGhana: {
+      minAmount: {
+        doc: "Minimum transaction amount for Vodafone Cash Ghana (GHS)",
+        format: "nat",
+        default: 1,
+        env: "VODAFONE_GH_MIN_AMOUNT",
+      },
+      maxAmount: {
+        doc: "Maximum transaction amount for Vodafone Cash Ghana (GHS)",
+        format: "nat",
+        default: 5000,
+        env: "VODAFONE_GH_MAX_AMOUNT",
+      },
+      baseUrl: {
+        doc: "Base URL for Vodafone Cash Ghana (Telecel) API",
+        format: String,
+        default: "https://sandbox.vodafone.com.gh",
+        env: "VODAFONE_GH_BASE_URL",
+      },
+      apiKey: {
+        doc: "API Key for Vodafone Cash Ghana",
+        format: String,
+        default: "",
+        env: "VODAFONE_GH_API_KEY",
+      },
+      apiSecret: {
+        doc: "API Secret for Vodafone Cash Ghana",
+        format: String,
+        default: "",
+        env: "VODAFONE_GH_API_SECRET",
+      },
+      merchantCode: {
+        doc: "Merchant/short code for Vodafone Cash Ghana",
+        format: String,
+        default: "",
+        env: "VODAFONE_GH_MERCHANT_CODE",
+      },
+      callbackSecret: {
+        doc: "Shared secret used to verify Vodafone Cash Ghana webhook signatures",
+        format: String,
+        default: "",
+        env: "VODAFONE_GH_CALLBACK_SECRET",
+      },
+      currency: {
+        doc: "Currency for Vodafone Cash Ghana",
+        format: String,
+        default: "GHS",
+        env: "VODAFONE_GH_CURRENCY",
       },
     },
   },

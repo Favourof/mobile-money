@@ -8,6 +8,8 @@ import { registerStatusCommand } from "./commands/status";
 import { registerDashboardCommand } from "./commands/dashboard";
 import { registerEscrowCommand } from "./commands/escrow";
 import { registerReconcileCommand } from "./commands/reconcile";
+import { registerBridgeCommands } from "./commands/bridge";
+import { registerWalletRotateCommand } from "./commands/walletRotate";
 import { printError } from "./dashboard";
 
 const program = new Command("momo-cli")
@@ -22,6 +24,8 @@ registerProfileCommand(program);
 registerDashboardCommand(program);
 registerEscrowCommand(program);
 registerReconcileCommand(program);
+registerBridgeCommands(program);
+registerWalletRotateCommand(program);
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);

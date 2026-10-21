@@ -5,6 +5,7 @@ import logger from "../../utils/logger";
 import CircuitBreaker from "opossum";
 import fs from "fs";
 import path from "path";
+import { sendAlert } from "../alertService";
 
 interface AirtelTokenResponse {
   access_token: string;
@@ -157,7 +158,16 @@ export class AirtelService extends BaseProvider {
 
     this.breaker = new CircuitBreaker(async (fn: () => Promise<any>) => fn(), breakerOptions);
 
-    this.breaker.on("open", () => logAuditStatusChange("open", { volumeThreshold: 10, errorThresholdPercentage: 50 }));
+    this.breaker.on("open", () => {
+      logAuditStatusChange("open", { volumeThreshold: 10, errorThresholdPercentage: 50 });
+      void sendAlert({
+        provider: "airtel",
+        error: "Circuit breaker OPEN: error rate exceeded 50% threshold over the last 10 requests",
+        severity: "critical",
+      }).catch((err) =>
+        logger.error({ error: err }, "Failed to dispatch circuit breaker open alert"),
+      );
+    });
     this.breaker.on("halfOpen", () => logAuditStatusChange("half_open", {}));
     this.breaker.on("close", () => logAuditStatusChange("closed", {}));
     this.breaker.fallback(() => {
@@ -333,6 +343,39 @@ export class AirtelService extends BaseProvider {
     } catch (error) {
       logger.error({ reference, error: error instanceof Error ? error.message : error }, "Airtel getTransactionStatus failed");
       return { status: "unknown" };
+    }
+  }
+
+  async getBalance(): Promise<{ success: boolean; data?: any; error?: string }> {
+    const endpoint = `/standard/v1/users/balance`;
+    try {
+      const token = await this.getAccessToken();
+      const response = await this.executeWithBreaker(async () =>
+        axios.get(
+          `${this.baseUrl}${endpoint}`,
+          {
+            headers: {
+              Authorization: this.buildBearerAuthHeader(token),
+              "X-Country": this.country,
+              "X-Currency": this.currency,
+              "Content-Type": "application/json",
+            },
+            timeout: this.timeoutMs,
+          }
+        )
+      );
+
+      if ((response as any).fallbackRouted) {
+        return { success: false, error: "Circuit breaker open" };
+      }
+
+      return {
+        success: true,
+        data: response.data,
+      };
+    } catch (error) {
+      logger.error({ error: error instanceof Error ? error.message : error }, "Airtel getBalance failed");
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 }

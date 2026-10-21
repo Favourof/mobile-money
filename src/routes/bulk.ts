@@ -10,6 +10,7 @@ import { MobileMoneyService } from "../services/mobilemoney/mobileMoneyService";
 import { StellarService } from "../services/stellar/stellarService";
 import { notifyTransactionWebhook, WebhookService } from "../services/webhook";
 import { checkAccountStatusStrict } from "../middleware/checkAccountStatus";
+import { optionalIdempotency } from "../middleware/idempotency";
 import highThroughputService, {
   PaymentOptions,
 } from "../services/stellar/highThroughputService";
@@ -254,6 +255,7 @@ bulkRoutes.post(
   authenticateToken,
   checkAccountStatusStrict,
   upload.single("file"),
+  optionalIdempotency,
   async (req: Request, res: Response) => {
     if (!req.file) {
       throw createError(
